@@ -6,11 +6,17 @@
 
 ## 快速演示
 
-运行 python -m climateledger demo --workspace fixtures，完成本地演示：创建 SQLite 数据库、注册合成指标与来源、摄入两行数据、发布快照并校验导出。再次执行会重用相同批次和发布版本。
+运行 python -m climateledger demo --workspace fixtures，完成本地演示：创建 SQLite 数据库、注册合成指标与来源、摄入两行数据并发布、对 2026-02 执行一次区间撤回（生成纯撤回发布）、补交更正并再次发布，最后校验最新与历史导出。再次执行会重用相同批次、通知和发布版本。
 
 单独使用时，把 --db path/to/ledger.sqlite3 放在子命令前。依次执行 register-indicator contract.json、register-source contract.json；需要单位换算时执行 register-unit rule.json。用 ingest batch.manifest.json 摄入数据，batch ID 查看记录；待审批次用 approve ID REVISION 审核，然后用 publish ID REVISION 发布。
 
 export VERSION --output bundle.json 导出指定快照，verify bundle.json 检查摘要，series INDICATOR --version VERSION 查询发布值。coverage、discrepancies、compare、replay 和 audit 分别用于查看覆盖、来源分歧、版本变化、原始文件重放及审计链。
+
+## 撤回与更正
+
+撤回通知是本地 JSON 文件，包含 source、notice_id、indicator、first_period、last_period、reason 和可选 detail，针对单一来源与指标的连续期间。retract notice.json 记录通知：内容摘要相同则重复提交幂等，不产生新代次；内容变化在同一 notice_id 下形成新代次，旧代次保留但仅最新代次生效。通知一经记录即对后续发布生效：apply-retraction ID REVISION 立即生成只含撤回的发布，普通批次发布也会携带当时未应用的撤回。发布清单的 retractions 字段列出本次应用的撤回及移除条目数；移除只针对该来源该指标在区间内的已发布值，其他月份和其他来源的条目不受影响。已发布旧版本保持不可变，export 与 verify 始终可核验。
+
+更正尚未到齐时，当前发布版本中该区间没有值；retractions 命令按通知列出状态（open 已记录、applied 已生效、fulfilled 已补全）与未补交期间，coverage 报告附带未完结撤回的缺口，旧版本中的原值仍可查询。更正按普通批次摄入：质量检查对触及未完结撤回区间的批次给出 retraction_pending 审核发现，逐个列出尚未补交的期间；区间在当前发布中补全时通知转为 fulfilled。重复 apply-retraction 返回首次应用它的发布，重复到达的相同通知不会产生新代次。
 
 ## 输入与状态
 

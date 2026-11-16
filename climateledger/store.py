@@ -39,6 +39,15 @@ CREATE TABLE IF NOT EXISTS release_entries (
     version INTEGER NOT NULL, source TEXT NOT NULL, indicator TEXT NOT NULL, period TEXT NOT NULL,
     batch_id INTEGER NOT NULL, line INTEGER NOT NULL, value TEXT NOT NULL, unit TEXT NOT NULL,
     PRIMARY KEY(version, source, indicator, period), FOREIGN KEY(version) REFERENCES releases(version));
+CREATE TABLE IF NOT EXISTS retractions (
+    id INTEGER PRIMARY KEY, source TEXT NOT NULL, notice_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    indicator TEXT NOT NULL, first_period TEXT NOT NULL, last_period TEXT NOT NULL,
+    reason TEXT NOT NULL, detail TEXT NOT NULL, notice_hash TEXT NOT NULL,
+    status TEXT NOT NULL, received_at TEXT NOT NULL,
+    applied_version INTEGER, fulfilled_version INTEGER,
+    UNIQUE(source, notice_id, revision),
+    FOREIGN KEY(source) REFERENCES sources(key), FOREIGN KEY(indicator) REFERENCES indicators(key));
+CREATE INDEX IF NOT EXISTS retractions_lookup ON retractions(source, notice_id, revision DESC);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, detail TEXT NOT NULL);
 """
@@ -196,10 +205,12 @@ class LedgerStore:
             "SELECT * FROM measurements WHERE batch_id=? ORDER BY line", (batch_id,))]
 
     def current_measurement(self, source: str, indicator: str, period: str) -> dict[str, Any] | None:
+        latest = self.latest_release()
+        if latest is None:
+            return None
         row = self.connection.execute(
-            "SELECT e.* FROM release_entries e JOIN releases r ON r.version=e.version "
-            "WHERE e.source=? AND e.indicator=? AND e.period=? ORDER BY e.version DESC LIMIT 1",
-            (source, indicator, period)).fetchone()
+            "SELECT * FROM release_entries WHERE version=? AND source=? AND indicator=? AND period=?",
+            (latest["version"], source, indicator, period)).fetchone()
         return dict(row) if row else None
 
     def latest_release(self) -> dict[str, Any] | None:
@@ -221,8 +232,51 @@ class LedgerStore:
         return [dict(row) for row in self.connection.execute(
             "SELECT * FROM release_entries WHERE version=? ORDER BY source,indicator,period", (version,))]
 
+    def insert_retraction(self, notice, notice_hash: str) -> tuple[dict[str, Any], bool]:
+        with self.transaction():
+            latest = self.latest_retraction(notice.source, notice.notice_id)
+            if latest and latest["notice_hash"] == notice_hash:
+                return latest, True
+            revision = 1 if latest is None else latest["revision"] + 1
+            cursor = self.connection.execute(
+                "INSERT INTO retractions(source,notice_id,revision,indicator,first_period,last_period,"
+                "reason,detail,notice_hash,status,received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (notice.source, notice.notice_id, revision, notice.indicator, notice.first_period,
+                 notice.last_period, notice.reason, notice.detail, notice_hash, "open", utc_now()))
+            retraction_id = cursor.lastrowid
+            self.event("retract", f"retraction:{retraction_id}",
+                       {"notice_id": notice.notice_id, "revision": revision, "notice_hash": notice_hash})
+            return self.retraction(retraction_id), False
+
+    def latest_retraction(self, source: str, notice_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM retractions WHERE source=? AND notice_id=? ORDER BY revision DESC LIMIT 1",
+            (source, notice_id)).fetchone()
+        return dict(row) if row else None
+
+    def retraction(self, retraction_id: int) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM retractions WHERE id=?", (retraction_id,)).fetchone()
+        if row is None:
+            raise ContractError("unknown_retraction", f"retraction {retraction_id} does not exist")
+        return dict(row)
+
+    def latest_retractions(self, status: str | None = None) -> list[dict[str, Any]]:
+        query = ("SELECT r.* FROM retractions r JOIN (SELECT source, notice_id, MAX(revision) AS peak "
+                 "FROM retractions GROUP BY source, notice_id) t ON t.source=r.source "
+                 "AND t.notice_id=r.notice_id AND t.peak=r.revision")
+        args: tuple = ()
+        if status:
+            query += " WHERE r.status=?"
+            args = (status,)
+        return [dict(row) for row in self.connection.execute(query + " ORDER BY r.id", args)]
+
+    def list_retractions(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM retractions ORDER BY id")]
+
     def publish(self, batch_id: int, expected_revision: int, manifest: dict[str, Any],
-                entries: list[dict[str, Any]], digest: str) -> dict[str, Any]:
+                entries: list[dict[str, Any]], digest: str,
+                applied_retractions: list[int] | None = None,
+                fulfilled_retractions: list[int] | None = None) -> dict[str, Any]:
         with self.transaction():
             batch = self.batch(batch_id)
             latest = self.latest_batch(batch["source"], batch["external_id"])
@@ -232,16 +286,51 @@ class LedgerStore:
                 raise ContractError("stale_revision", "cannot publish a superseded revision")
             if batch["status"] not in {"accepted", "approved"}:
                 raise ContractError("quality_gate", "batch is not accepted or approved")
-            current_version = self.latest_release()["version"] if self.latest_release() else 0
-            version = current_version + 1
-            if manifest["version"] != version:
-                raise ContractError("release_race", "release version changed while preparing")
-            self.connection.execute("INSERT INTO releases VALUES(?,?,?,?)",
-                                    (version, utc_now(), canonical_bytes(manifest).decode(), digest))
-            self.connection.executemany("INSERT INTO release_entries VALUES(?,?,?,?,?,?,?,?)",
-                [(version, item["source"], item["indicator"], item["period"],
-                  item["batch_id"], item["line"], item["value"], item["unit"]) for item in entries])
+            release = self._insert_release(manifest, entries, digest,
+                                           applied_retractions or (), fulfilled_retractions or ())
             self.connection.execute("UPDATE batches SET status='published',published_version=? WHERE id=?",
-                                    (version, batch_id))
-            self.event("publish", f"batch:{batch_id}", {"version": version, "digest": digest})
-            return self.release(version)
+                                    (release["version"], batch_id))
+            self.event("publish", f"batch:{batch_id}", {"version": release["version"], "digest": digest})
+            return release
+
+    def publish_retraction(self, retraction_id: int, expected_revision: int, manifest: dict[str, Any],
+                           entries: list[dict[str, Any]], digest: str,
+                           applied_retractions: list[int], fulfilled_retractions: list[int]) -> dict[str, Any]:
+        with self.transaction():
+            notice = self.retraction(retraction_id)
+            if notice["applied_version"] is not None:
+                if notice["revision"] != expected_revision:
+                    raise ContractError("stale_revision", "expected revision differs")
+                return self.release(notice["applied_version"])
+            latest = self.latest_retraction(notice["source"], notice["notice_id"])
+            if latest["id"] != retraction_id or notice["revision"] != expected_revision:
+                raise ContractError("stale_revision", "cannot apply a superseded retraction")
+            return self._insert_release(manifest, entries, digest, applied_retractions, fulfilled_retractions)
+
+    def _insert_release(self, manifest: dict[str, Any], entries: list[dict[str, Any]], digest: str,
+                        applied_retractions, fulfilled_retractions) -> dict[str, Any]:
+        current_version = self.latest_release()["version"] if self.latest_release() else 0
+        version = current_version + 1
+        if manifest["version"] != version:
+            raise ContractError("release_race", "release version changed while preparing")
+        self.connection.execute("INSERT INTO releases VALUES(?,?,?,?)",
+                                (version, utc_now(), canonical_bytes(manifest).decode(), digest))
+        self.connection.executemany("INSERT INTO release_entries VALUES(?,?,?,?,?,?,?,?)",
+            [(version, item["source"], item["indicator"], item["period"],
+              item["batch_id"], item["line"], item["value"], item["unit"]) for item in entries])
+        for retraction_id in applied_retractions:
+            notice = self.retraction(retraction_id)
+            if notice["applied_version"] is not None:
+                raise ContractError("release_race", "retraction was already applied")
+            self.connection.execute("UPDATE retractions SET status='applied',applied_version=? WHERE id=?",
+                                    (version, retraction_id))
+            self.event("apply_retraction", f"retraction:{retraction_id}",
+                       {"version": version, "revision": notice["revision"]})
+        for retraction_id in fulfilled_retractions:
+            notice = self.retraction(retraction_id)
+            if notice["status"] != "applied":
+                raise ContractError("release_race", "retraction is not awaiting fulfillment")
+            self.connection.execute("UPDATE retractions SET status='fulfilled',fulfilled_version=? WHERE id=?",
+                                    (version, retraction_id))
+            self.event("fulfill_retraction", f"retraction:{retraction_id}", {"version": version})
+        return self.release(version)

@@ -5,7 +5,7 @@ from dataclasses import dataclass, asdict
 from decimal import Decimal
 from typing import Any
 
-from .normalize import period_index, period_from_index
+from .normalize import interval_periods, period_index, period_from_index
 from .registry import Registry
 
 
@@ -35,27 +35,54 @@ class CoverageReporter:
             self.registry.indicator(indicator_key)
         if source_key is not None:
             self.registry.source(source_key)
+        entries = self.store.release_entries(version)
         grouped: dict[tuple[str, str], set[str]] = defaultdict(set)
-        for row in self.store.release_entries(version):
+        for row in entries:
             if indicator_key is not None and row["indicator"] != indicator_key:
                 continue
             if source_key is not None and row["source"] != source_key:
                 continue
             grouped[(row["source"], row["indicator"])].add(row["period"])
         results = []
-        for (source, indicator_key), periods in sorted(grouped.items()):
-            indicator = self.registry.indicator(indicator_key)
+        for (source, series_indicator), periods in sorted(grouped.items()):
+            indicator = self.registry.indicator(series_indicator)
             indexes = {period_index(period, indicator.cadence) for period in periods}
             start, end = min(indexes), max(indexes)
             missing = [period_from_index(value, indicator.cadence)
                        for value in range(start, end + 1) if value not in indexes]
-            results.append(CoverageRow(source, indicator_key, period_from_index(start, indicator.cadence),
+            results.append(CoverageRow(source, series_indicator, period_from_index(start, indicator.cadence),
                                        period_from_index(end, indicator.cadence), len(indexes),
                                        end - start + 1, missing))
         return {"version": version, "series_count": len(results),
                 "observed": sum(row.observed for row in results),
                 "missing": sum(len(row.missing) for row in results),
-                "series": [row.document() for row in results]}
+                "series": [row.document() for row in results],
+                "retractions": self._retractions(version, entries, indicator_key, source_key)}
+
+    def _retractions(self, version: int, entries: list[dict[str, Any]],
+                     indicator_key: str | None, source_key: str | None) -> list[dict[str, Any]]:
+        present = {(row["source"], row["indicator"], row["period"]) for row in entries}
+        section = []
+        for notice in self.store.latest_retractions():
+            if notice["applied_version"] is None or notice["applied_version"] > version:
+                continue
+            if notice["fulfilled_version"] is not None and notice["fulfilled_version"] <= version:
+                continue
+            if indicator_key is not None and notice["indicator"] != indicator_key:
+                continue
+            if source_key is not None and notice["source"] != source_key:
+                continue
+            indicator = self.registry.indicator(notice["indicator"])
+            outstanding = [period for period in
+                           interval_periods(notice["first_period"], notice["last_period"],
+                                            indicator.cadence)
+                           if (notice["source"], notice["indicator"], period) not in present]
+            section.append({"id": notice["id"], "notice_id": notice["notice_id"],
+                            "source": notice["source"], "indicator": notice["indicator"],
+                            "first_period": notice["first_period"],
+                            "last_period": notice["last_period"],
+                            "outstanding": outstanding})
+        return section
 
     def source_matrix(self, version: int, indicator_key: str) -> dict[str, Any]:
         indicator = self.registry.indicator(indicator_key)

@@ -120,7 +120,11 @@ class CliTests(unittest.TestCase):
 
     def test_cli_demo_is_repeatable(self):
         workspace = self.root / "demo"
-        self.assertEqual(self.call("demo", "--workspace", str(workspace))[1]["verified"], True)
+        first = self.call("demo", "--workspace", str(workspace))[1]
+        self.assertEqual(first["verified"], True)
+        self.assertEqual(first["release_version"], 3)
+        self.assertEqual(first["retraction_release"], 2)
         repeat = self.call("demo", "--workspace", str(workspace))[1]
         self.assertTrue(repeat["idempotent"])
-        self.assertEqual(repeat["release_version"], 1)
+        self.assertEqual(repeat["release_version"], 3)
+        self.assertEqual(repeat["digest"], first["digest"])

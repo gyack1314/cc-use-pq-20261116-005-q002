@@ -58,6 +58,12 @@ def period_from_index(index: int, cadence: str) -> str:
     return f"{year:04d}-{zero_month + 1:02d}"
 
 
+def interval_periods(first: str, last: str, cadence: str) -> list[str]:
+    start = period_index(first, cadence)
+    end = period_index(last, cadence)
+    return [period_from_index(index, cadence) for index in range(start, end + 1)]
+
+
 def canonical_decimal(value: Decimal, precision: int) -> str:
     quantum = Decimal(1).scaleb(-precision)
     try:

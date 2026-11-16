@@ -54,6 +54,25 @@ class AuditInspector:
                 "batch_ids": batches, "sources": source_keys, "indicators": indicator_keys,
                 "entry_count": len(bundle["entries"]), "broken_entries": missing}
 
+    def retraction_trace(self, retraction_id: int) -> dict[str, Any]:
+        notice = self.store.retraction(retraction_id)
+        events = self.store.events(f"retraction:{retraction_id}")
+        problems = []
+        if notice["applied_version"] is not None:
+            manifest = self.store.release(notice["applied_version"])["manifest"]
+            applied = manifest.get("retractions", [])
+            if not any(item.get("id") == retraction_id and item.get("revision") == notice["revision"]
+                       for item in applied):
+                problems.append("applying release manifest does not list this retraction")
+        if notice["fulfilled_version"] is not None:
+            if notice["applied_version"] is None or notice["fulfilled_version"] < notice["applied_version"]:
+                problems.append("fulfilled before applied")
+        return {"id": retraction_id, "source": notice["source"], "notice_id": notice["notice_id"],
+                "revision": notice["revision"], "status": notice["status"],
+                "applied_version": notice["applied_version"],
+                "fulfilled_version": notice["fulfilled_version"],
+                "event_count": len(events), "verified": not problems, "problems": problems}
+
     def inspect_all(self) -> dict[str, Any]:
         batches = self.store.list_batches()
         latest = self.store.latest_release()
@@ -62,6 +81,11 @@ class AuditInspector:
         if latest:
             releases = [self.release_trace(version) for version in range(1, latest["version"] + 1)]
         violations = [entry for entry in releases if not entry["verified"]]
+        retraction_traces = [self.retraction_trace(notice["id"])
+                             for notice in self.store.latest_retractions()]
+        retraction_violations = [trace for trace in retraction_traces if not trace["verified"]]
         return {"batch_count": len(batches), "release_count": len(releases),
                 "violations": violations, "batch_traces": batch_traces,
-                "release_digests": [release["digest"] for release in releases]}
+                "release_digests": [release["digest"] for release in releases],
+                "retractions": retraction_traces,
+                "retraction_violations": retraction_violations}

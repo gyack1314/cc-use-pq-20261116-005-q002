@@ -8,6 +8,7 @@ from .normalize import Normalizer
 from .quality import QualityGate
 from .registry import ContractError, Registry
 from .release import ReleaseBuilder
+from .retraction import RetractionNotice, RetractionReporter
 from .store import LedgerStore
 from .compare import Comparator, SeriesWindow
 from .audit import AuditInspector
@@ -22,7 +23,7 @@ class LedgerService:
         self.registry = Registry(self.store)
         self.normalizer = Normalizer(self.registry)
         self.quality = QualityGate(self.registry, self.store)
-        self.releases = ReleaseBuilder(self.store)
+        self.releases = ReleaseBuilder(self.store, self.registry)
         self.comparator = Comparator(self.store, self.registry)
         self.windows = SeriesWindow(self.store, self.registry)
         self.audit = AuditInspector(self.store, self.registry, self.releases)
@@ -31,6 +32,7 @@ class LedgerService:
         self.replay_inspector = ReplayInspector(self.store, self.registry)
         self.queue = ReviewQueue(self.store)
         self.receipts = ReceiptCatalog(self.store, self.registry)
+        self.retraction_reports = RetractionReporter(self.store, self.registry)
 
     def close(self) -> None:
         self.store.close()
@@ -76,6 +78,20 @@ class LedgerService:
 
     def publish(self, batch_id: int, expected_revision: int) -> dict[str, Any]:
         return self.releases.publish(batch_id, expected_revision)
+
+    def record_retraction(self, notice: dict[str, Any]) -> dict[str, Any]:
+        parsed = RetractionNotice.from_dict(notice, self.registry)
+        row, idempotent = self.store.insert_retraction(parsed, parsed.notice_hash())
+        return {"retraction": row, "idempotent": idempotent}
+
+    def apply_retraction(self, retraction_id: int, expected_revision: int) -> dict[str, Any]:
+        return self.releases.apply_retraction(retraction_id, expected_revision)
+
+    def retractions(self, source: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        return self.retraction_reports.list(source, status)
+
+    def retraction(self, retraction_id: int) -> dict[str, Any]:
+        return self.retraction_reports.detail(retraction_id)
 
     def export(self, version: int) -> dict[str, Any]:
         return self.releases.export(version)
@@ -146,9 +162,12 @@ class LedgerService:
     def status(self) -> dict[str, Any]:
         latest = self.store.latest_release()
         batches = self.store.list_batches()
+        notices = self.store.latest_retractions()
         return {"indicators": len(self.registry.list_indicators()),
                 "sources": len(self.registry.list_sources()),
                 "batches": len(batches),
                 "by_status": {name: sum(row["status"] == name for row in batches)
                               for name in ("accepted", "review", "rejected", "approved", "published")},
+                "retractions": {name: sum(row["status"] == name for row in notices)
+                                for name in ("open", "applied", "fulfilled")},
                 "latest_release": latest["version"] if latest else None}

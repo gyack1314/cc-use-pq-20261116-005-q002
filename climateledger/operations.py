@@ -109,7 +109,8 @@ class ReceiptCatalog:
 
     def release_receipt(self, version: int) -> dict[str, Any]:
         release = self.store.release(version)
-        batch = release["manifest"]["batch"]
+        manifest = release["manifest"]
         return {"version": version, "created_at": release["created_at"],
-                "digest": release["digest"], "parent_digest": release["manifest"]["parent_digest"],
-                "entry_count": release["manifest"]["entry_count"], "source_batch": batch}
+                "digest": release["digest"], "parent_digest": manifest["parent_digest"],
+                "entry_count": manifest["entry_count"], "source_batch": manifest.get("batch"),
+                "retractions": manifest.get("retractions", [])}

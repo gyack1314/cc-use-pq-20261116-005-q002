@@ -4,7 +4,7 @@ from dataclasses import dataclass, asdict
 from decimal import Decimal
 from typing import Any
 
-from .normalize import Measurement, index_by_series, period_index, period_from_index
+from .normalize import Measurement, index_by_series, interval_periods, period_index, period_from_index
 from .registry import Registry
 
 
@@ -84,12 +84,48 @@ class QualityGate:
                 if prior is not None and prior["value"] != item.value:
                     findings.append(Finding("review", "revised_value", key, item.period, item.line,
                                             f"published value {prior['value']} differs"))
+        findings.extend(self._retraction_findings(source_key, series))
         if not measurements:
             findings.append(Finding("block", "empty_batch", None, None, None, "no accepted measurements"))
         status = "rejected" if any(item.severity == "block" for item in findings) else (
             "review" if findings else "accepted")
         findings.sort(key=lambda item: (item.severity, item.code, item.indicator or "", item.period or "", item.line or 0))
         return Assessment(status, len(measurements), len(rejected), tuple(findings))
+
+    def _retraction_findings(self, source_key: str,
+                             series: dict[str, list[Measurement]]) -> list[Finding]:
+        notices = [notice for notice in self.store.latest_retractions()
+                   if notice["source"] == source_key and notice["status"] != "fulfilled"]
+        if not notices:
+            return []
+        latest = self.store.latest_release()
+        present: set[tuple[str, str]] = set()
+        if latest:
+            present = {(row["indicator"], row["period"])
+                       for row in self.store.release_entries(latest["version"])
+                       if row["source"] == source_key}
+        findings: list[Finding] = []
+        for notice in notices:
+            items = series.get(notice["indicator"])
+            if not items:
+                continue
+            indicator = self.registry.indicator(notice["indicator"])
+            interval = set(interval_periods(notice["first_period"], notice["last_period"],
+                                            indicator.cadence))
+            batch_periods = {item.period for item in items}
+            if not interval & batch_periods:
+                continue
+            corrected: set[str] = set()
+            if notice["status"] == "applied":
+                corrected = {period for key, period in present
+                             if key == notice["indicator"]} & interval
+            outstanding = sorted(interval - batch_periods - corrected,
+                                 key=lambda period: period_index(period, indicator.cadence))
+            for period in outstanding:
+                findings.append(Finding("review", "retraction_pending", notice["indicator"], period,
+                                        None, f"correction outstanding for retraction "
+                                              f"{notice['notice_id']} revision {notice['revision']}"))
+        return findings
 
     def reviewable(self, assessment: Assessment) -> list[Finding]:
         return [finding for finding in assessment.findings if finding.severity == "review"]

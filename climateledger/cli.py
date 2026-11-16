@@ -29,6 +29,16 @@ def parser() -> ArgumentParser:
     publish = commands.add_parser("publish")
     publish.add_argument("batch", type=int)
     publish.add_argument("revision", type=int)
+    retract = commands.add_parser("retract")
+    retract.add_argument("notice", help="local retraction notice JSON")
+    apply_retraction = commands.add_parser("apply-retraction")
+    apply_retraction.add_argument("retraction", type=int)
+    apply_retraction.add_argument("revision", type=int)
+    retractions = commands.add_parser("retractions")
+    retractions.add_argument("--source")
+    retractions.add_argument("--status", choices=("open", "applied", "fulfilled"))
+    retraction = commands.add_parser("retraction")
+    retraction.add_argument("id", type=int)
     batch = commands.add_parser("batch")
     batch.add_argument("id", type=int)
     batches = commands.add_parser("batches")
@@ -117,11 +127,26 @@ def demo(workspace: str) -> dict[str, Any]:
         if batch["status"] not in {"accepted", "published"}:
             raise ContractError("demo_quality", "synthetic batch did not pass quality gate")
         release = service.publish(batch["id"], batch["revision"])
-        bundle = service.export(release["version"])
+        notice = service.record_retraction({"source": "sample_lab", "notice_id": "demo_retraction",
+                                            "indicator": "co2_ppm", "first_period": "2026-02",
+                                            "last_period": "2026-02", "reason": "wrong_calibration",
+                                            "detail": "Synthetic demo retraction"})["retraction"]
+        applied = service.apply_retraction(notice["id"], notice["revision"])
+        correction = write_manifest(root, source="sample_lab", batch_id="demo_correction",
+                                    rows=[{"indicator": "co2_ppm", "period": "2026-02",
+                                           "value": "429500", "unit": "ppb"}])
+        corrected = service.ingest(correction)["batch"]
+        if corrected["status"] not in {"accepted", "published"}:
+            raise ContractError("demo_quality", "synthetic correction did not pass quality gate")
+        final = service.publish(corrected["id"], corrected["revision"])
+        bundle = service.export(final["version"])
         if not service.verify(bundle) or len(bundle["entries"]) != 2:
             raise ContractError("demo_verify", "export could not be verified")
+        if not service.verify(service.export(release["version"])):
+            raise ContractError("demo_verify", "earlier release could not be verified")
         return {"batch_id": batch["id"], "idempotent": ingested["idempotent"],
-                "release_version": release["version"], "digest": release["digest"],
+                "release_version": final["version"], "retraction_id": notice["id"],
+                "retraction_release": applied["version"], "digest": final["digest"],
                 "entries": len(bundle["entries"]), "verified": True}
 
 
@@ -143,6 +168,14 @@ def execute(args: Namespace) -> Any:
             return service.preview(args.batch, args.revision)
         if args.command == "publish":
             return service.publish(args.batch, args.revision)
+        if args.command == "retract":
+            return service.record_retraction(read_json(args.notice))
+        if args.command == "apply-retraction":
+            return service.apply_retraction(args.retraction, args.revision)
+        if args.command == "retractions":
+            return service.retractions(args.source, args.status)
+        if args.command == "retraction":
+            return service.retraction(args.id)
         if args.command == "batch":
             return service.batch(args.id)
         if args.command == "batches":
